@@ -1,0 +1,102 @@
+variables:
+  BuildConfiguration: 'Ad-Hoc'
+  DotnetSdkVersion: '3.1.404'
+  MonoVersion: '6_12_0'
+  XcodeRootPath: '/Applications/Xcode_12.2.app'
+
+#  AppleCertificatePassword: 'dummy' これはPipelineの環境変数にSecure属性で登録する
+#  AppCenterAppSlug: 'AppCenterの識別名 "チーム名/アプリ名" '
+
+stages:
+  - stage: 'build_app'
+    displayName: 'Build Xamarin iOS app'
+    jobs:
+      - job: 'build'
+        workspace:
+          clean: 'all'
+        pool:
+          vmImage: 'macOS-10.15' # or 'macOS-latest'
+        steps:
+
+          # .NET SDK をインストール
+          - task: UseDotNet@2
+            inputs:
+              packageType: 'sdk'
+              version: '$(DotnetSdkVersion)'
+
+          # mono バージョンを固定
+          - script: sudo $AGENT_HOMEDIRECTORY/scripts/select-xamarin-sdk.sh $(MonoVersion)
+
+          # Xcode バージョンを固定
+          - script: echo '##vso[task.setvariable variable=MD_APPLE_SDK_ROOT;]'$(XcodeRootPath);sudo xcode-select --switch $(XcodeRootPath)/Contents/Developer
+
+          # Provisioning Profile をインストール
+          # 'sample.mobileprovision' を SecureFiles に保存しておく
+          - task: InstallAppleProvisioningProfile@1
+            inputs:
+              provisioningProfileLocation: secureFiles
+              provProfileSecureFile: 'sample.mobileprovision'
+              removeProfile: true
+
+          # 署名証明書をインストール
+          # 'sample.p12' を SecureFiles に保存しておく
+          # AppleCertificatePassword を Secure 設定で環境変数に設定しておく
+          - task: InstallAppleCertificate@2
+            inputs:
+              keychain: 'temp'
+              certSecureFile: 'sample.p12'
+              certPwd: '$(AppleCertificatePassword)'
+
+          # NuGet tools をインストール
+          - task: NuGetToolInstaller@1
+
+          # NuGet パッケージを復元
+          - task: NuGetCommand@2
+            inputs:
+              command: 'restore'
+              restoreSolution: '**/*.csproj'
+              feedsToUse: 'select'
+
+          # Xamarin iOS アプリをビルド
+          - task: XamariniOS@2
+            inputs:
+              solutionFile: 'SampleApp.sln'
+              configuration: '$(BuildConfiguration)'
+              packageApp: true
+              runNugetRestore: false
+              args: '/p:IpaPackageDir="$(Build.ArtifactStagingDirectory)"'
+              signingIdentity: '$(APPLE_CERTIFICATE_SIGNING_IDENTITY)'
+              signingProvisioningProfileID: '$(APPLE_PROV_PROFILE_UUID)'
+
+          # ビルド結果の ipa ファイルを Pipeline Artifacts へ転送
+          - task: PublishBuildArtifacts@1
+            condition: succeededOrFailed()
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+
+
+  - stage: 'distribute_appcenter'
+    displayName: 'Distribute to AppCenter'
+    dependsOn: 'build_app'
+    jobs:
+      - job: 'distribute'
+        workspace:
+          clean: 'all'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+
+          # Pipeline Artifacts をダウンロード
+          - download: current
+
+          # AppCenter へビルドしたアプリを配信
+          - task: AppCenterDistribute@3
+            displayName: 'Distribute to AppCenter'
+            inputs:
+              serverEndpoint: 'AppCenterConnection'
+              appSlug: '$(AppCenterAppSlug)'
+              appFile: '$(Pipeline.Workspace)/drop/SampleApp.iOS.ipa'
+              releaseNotesOption: 'input'
+              releaseNotesInput: '$(Build.SourceVersionMessage)'
+              destinationType: 'groups'
+              isSilent: false
